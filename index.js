@@ -1,28 +1,34 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const redis = require("redis");
-const util = require("util");
 const KEY = `account1/balance`;
 const DEFAULT_BALANCE = 100;
+const charges = getCharges();
 exports.chargeRequestRedis = async function (input) {
     const redisClient = await getRedisClient();
-    var remainingBalance = await getBalanceRedis(redisClient, KEY);
-    var charges = getCharges();
-    const isAuthorized = authorizeRequest(remainingBalance, charges);
-    if (!isAuthorized) {
-        return {
-            remainingBalance,
-            isAuthorized,
-            charges: 0,
-        };
-    }
-    remainingBalance = await chargeRedis(redisClient, KEY, charges);
-    await disconnectRedis(redisClient);
-    return {
-        remainingBalance,
-        charges,
-        isAuthorized,
-    };
+    return new Promise((resolve, reject) => {
+        redisClient.multi().eval(`
+            local balance = redis.call('GET', KEYS[1])
+            if tonumber(balance) >= tonumber(ARGV[1]) then
+                redis.call('DECRBY', KEYS[1], ARGV[1])
+            return tonumber(balance)
+            end`, 1, KEY, charges)
+            .exec((err, results) => {
+            if (err) {
+                reject(err);
+            } else {
+                const balance = Number(results[0]);
+                const isAuthorized = balance - charges > 0;
+                resolve({
+                    remainingBalance: isAuthorized ? balance - charges : 0,
+                    isAuthorized,
+                    charges: isAuthorized ? (balance - charges) / charges : 0
+                });
+            }
+        });
+    }).finally(()=> {
+        disconnectRedis(redisClient);
+    });
 };
 exports.resetRedis = async function () {
     const redisClient = await getRedisClient();
@@ -72,16 +78,6 @@ async function disconnectRedis(client) {
         });
     });
 }
-function authorizeRequest(remainingBalance, charges) {
-    return remainingBalance >= charges;
-}
 function getCharges() {
     return DEFAULT_BALANCE / 20;
-}
-async function getBalanceRedis(redisClient, key) {
-    const res = await util.promisify(redisClient.get).bind(redisClient).call(redisClient, key);
-    return parseInt(res || "0");
-}
-async function chargeRedis(redisClient, key, charges) {
-    return util.promisify(redisClient.decrby).bind(redisClient).call(redisClient, key, charges);
 }
